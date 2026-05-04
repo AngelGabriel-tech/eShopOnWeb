@@ -1,55 +1,105 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# More GitHub Actions for Azure: https://github.com/Azure/actions
+name: eShopOnWeb Build and Test
 
-name: Build and deploy ASP.Net Core app to Azure Web App - Mobitech
+#Triggers (uncomment line below to use it)
+on: [push, workflow_dispatch]
 
-on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+#Environment variables https://docs.github.com/en/actions/learn-github-actions/environment-variables
+env:
+  RESOURCE-GROUP: MobitechRG
+  LOCATION: canadacentral
+  TEMPLATE-FILE: infra/webapp.bicep
+  SUBSCRIPTION-ID: 9a07ab10-b4b8-4b54-a596-55895433f722
+  WEBAPP-NAME: Mobitech
+
 
 jobs:
-  build:
+  #Build, test and publish .net web project in repository
+  buildandtest:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read #This is required for actions/checkout
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up .NET Core
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.x'
-
-      - name: Build with dotnet
-        run: dotnet build --configuration Release
-
-      - name: dotnet publish
-        run: dotnet publish -c Release -o ${{env.DOTNET_ROOT}}/myapp
-
-      - name: Upload artifact for deployment job
-        uses: actions/upload-artifact@v4
-        with:
-          name: .net-app
-          path: ${{env.DOTNET_ROOT}}/myapp
-
+    #checkout the repository
+    - uses: actions/checkout@v4
+    #prepare runner for desired .net version SDK
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+        dotnet-quality: 'preview'
+    #Build/Test/Publish the .net project
+    - name: Build with dotnet
+      run: dotnet build ./eShopOnWeb.sln --configuration Release
+    - name: Test with dotnet
+      run: dotnet test ./eShopOnWeb.sln --configuration Release
+    - name: dotnet publish
+      run: |
+        dotnet publish ./src/Web/Web.csproj -c Release -o ${{env.DOTNET_ROOT}}/myapp
+        cd ${{env.DOTNET_ROOT}}/myapp
+        zip -r ../app.zip .
+    # upload the published website code artifacts
+    - name: Upload artifact for deployment job
+      uses: actions/upload-artifact@v4
+      with:
+        name: .net-app
+        path: ${{env.DOTNET_ROOT}}/app.zip
+        
+    # upload the bicep template as artifacts for next job
+    - name: Upload artifact for deployment job
+      uses: actions/upload-artifact@v4
+      with:
+        name: bicep-template
+        path: ${{ env.TEMPLATE-FILE }}
+        
+  # Use Bicep to deploy infrastructure + Publish webapp 
   deploy:
     runs-on: ubuntu-latest
-    needs: build
-    
+    needs: buildandtest
+    environment:
+      name: 'Development'
     steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: .net-app
-      
-      - name: Deploy to Azure Web App
-        id: deploy-to-webapp
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: 'Mobitech'
-          slot-name: 'Production'
-          package: .
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_B97D52341A664F1DB75790D18BA14AB5 }}
+    
+    #Download the publish files created in previous job
+    - name: Download artifact from build job
+      uses: actions/download-artifact@v4
+      with:
+        name: .net-app
+        path: .net-app
+  
+    #Download the bicep templates from previous job
+    - name: Download artifact from build job
+      uses: actions/download-artifact@v4
+      with:
+        name: bicep-template
+        path: bicep-template
+        
+   #Login in your azure subscription using a service principal (credentials stored as GitHub Secret in repo)
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+           
+    # Deploy Azure WebApp using Bicep file
+    - name: deploy
+      uses: azure/arm-deploy@v2
+      with:
+        subscriptionId: ${{ env.SUBSCRIPTION-ID }}
+        resourceGroupName: ${{ env.RESOURCE-GROUP }}
+        template: bicep-template/webapp.bicep
+        parameters: 'webAppName=${{ env.WEBAPP-NAME }} location=${{ env.LOCATION }} appServicePlanName=ASP-MobitechRG-b3d9'
+        failOnStdErr: false   
+    
+    # Publish website to Azure App Service (WebApp)
+    # Step disabled due to issue where the site sometimes can't be found: https://github.com/microsoft/pipelines-appservice-lib/issues/56. Instead deploy using CLI
+    - name: Publish Website to WebApp
+      if: false #Disable step due to comment above
+      uses: Azure/webapps-deploy@v3
+      with:
+        type: ZIP
+        app-name: ${{ env.WEBAPP-NAME  }}
+        package: .net-app/app.zip
+
+    # Publish website to Azure App Service using CLI (WebApp)
+    - name: Publish Website to WebApp
+      uses: Azure/cli@v2
+      with:
+        inlineScript: |
+             az webapp deploy --name ${{ env.WEBAPP-NAME }} --resource-group ${{ env.RESOURCE-GROUP }} --src-path .net-app/app.zip --type zip
